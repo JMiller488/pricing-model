@@ -2,7 +2,7 @@
 generate_synthetic.py
 ---------------------
 Generates a synthetic transactional sales dataset that mirrors the
-structure of a real pricing dataset. The output is used to fit
+structure of a real FMCG pricing dataset. The output is used to fit
 a per-unit-price regression model and surface pricing leakage.
 
 The data is designed so that the regression has real patterns to
@@ -73,8 +73,19 @@ TARGET_TOTAL_ROWS = 100_000
 # Share of products with wide price dispersion (negotiated specials etc.)
 HIGH_DISPERSION_SHARE = 0.20
 
-# Number of ad-hoc product x state anomalies to inject.
-N_ADHOC_ANOMALIES = 50
+# Number of ad-hoc product x state anomalies to inject (Y0 baseline).
+N_ADHOC_ANOMALIES_Y0 = 30
+
+# Y1 has many more anomalies — this drags the Y1 R² down and creates the
+# diagnostic story that motivates the Cook's distance analysis.
+N_ADHOC_ANOMALIES_Y1 = 120
+
+# Number of high-leverage rogue products in Y1 only — a small set of
+# products with extreme price perturbations on a handful of transactions.
+# These are the points Cook's distance will flag and removing them
+# materially improves Y1's fit.
+N_Y1_ROGUE_PRODUCTS = 60
+N_Y1_ROGUE_TRANSACTIONS_PER_PRODUCT = 10
 
 # Customers that are systematically underpriced (the "leakage" cohort).
 N_LEAKAGE_CUSTOMERS = 40
@@ -160,6 +171,7 @@ def build_customers(reps: pd.DataFrame) -> pd.DataFrame:
     sizes = sizes / sizes.mean()  # normalise so mean size = 1.0
 
     # Premium reps tend to manage the larger accounts.
+    rep_names = reps["Rep"].tolist()
     premium_reps = reps[reps["premium"]]["Rep"].tolist()
     standard_reps = reps[~reps["premium"]]["Rep"].tolist()
 
@@ -202,19 +214,32 @@ def build_customers(reps: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_adhoc_anomalies(products: pd.DataFrame) -> dict[tuple[str, str], float]:
+def build_adhoc_anomalies(
+    products: pd.DataFrame, n_anomalies: int
+) -> dict[tuple[str, str], float]:
     """Pick random product x state combinations and assign weird multipliers."""
     anomalies = {}
     states = list(STATE_MULTIPLIERS.keys())
     product_ids = products["Product Description"].tolist()
 
-    for _ in range(N_ADHOC_ANOMALIES):
+    for _ in range(n_anomalies):
         product = RNG.choice(product_ids)
         state = RNG.choice(states)
         # Multiplier well outside normal noise — 0.65 to 1.45.
         multiplier = float(RNG.choice([RNG.uniform(0.65, 0.80), RNG.uniform(1.25, 1.45)]))
         anomalies[(product, state)] = multiplier
     return anomalies
+
+
+def build_y1_rogue_products(products: pd.DataFrame) -> set[str]:
+    """Pick a small set of products that will get extreme price shocks in Y1.
+
+    These shocks land on a handful of transactions per product and act as
+    high-leverage outliers — the kind Cook's distance is designed to flag.
+    """
+    product_ids = products["Product Description"].tolist()
+    rogue = RNG.choice(product_ids, size=N_Y1_ROGUE_PRODUCTS, replace=False)
+    return set(rogue.tolist())
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +250,16 @@ def build_adhoc_anomalies(products: pd.DataFrame) -> dict[tuple[str, str], float
 def generate_transactions(
     customers: pd.DataFrame,
     products: pd.DataFrame,
-    anomalies: dict[tuple[str, str], float],
+    anomalies_y0: dict[tuple[str, str], float],
+    anomalies_y1: dict[tuple[str, str], float],
+    y1_rogue_products: set[str],
 ) -> pd.DataFrame:
-    """Generate the full transactional dataset."""
+    """Generate the full transactional dataset.
+
+    Y1 carries more ad-hoc anomalies than Y0 and a small set of high-leverage
+    rogue product transactions, so the Y1 fit looks suspicious and motivates
+    the Cook's distance diagnostic.
+    """
     product_lookup = products.set_index("Product Description").to_dict("index")
     product_ids = products["Product Description"].to_numpy()
 
@@ -239,26 +271,26 @@ def generate_transactions(
         1, np.round(base_lines_per_customer * sizes_norm).astype(int)
     )
 
+    # Track how many rogue shocks remain to apply per product in Y1.
+    rogue_budget = {p: N_Y1_ROGUE_TRANSACTIONS_PER_PRODUCT for p in y1_rogue_products}
+
     rows = []
     for i, customer in customers.iterrows():
         n_lines = lines_per_customer_per_period[i]
 
         for period in PERIODS:
             chosen = RNG.choice(product_ids, size=n_lines, replace=True)
+            anomalies = anomalies_y1 if period == "Y1" else anomalies_y0
 
             for product_id in chosen:
                 product = product_lookup[product_id]
                 base_price = product["base_price"]
 
-                # Quantity — log-normal, scaled by customer size.
                 qty = float(RNG.lognormal(mean=2.5, sigma=1.0)) * (0.5 + sizes[i])
                 qty = max(1.0, round(qty, 2))
 
                 state_mult = STATE_MULTIPLIERS[customer["State"]]
-
-                # Volume discount — larger qty, lower per-unit price.
                 volume_discount = min(0.30, 0.04 * np.log(qty))
-
                 adhoc_mult = anomalies.get((product_id, customer["State"]), 1.0)
                 leakage_mult = 1.0 - customer["leakage_discount"]
 
@@ -270,6 +302,20 @@ def generate_transactions(
 
                 period_mult = 1.0 + (INFLATION_Y1 if period == "Y1" else 0.0)
 
+                # Y1 rogue shock — extreme multiplier on a few transactions
+                # of selected products. Creates high-leverage outliers that
+                # Cook's distance will flag.
+                rogue_mult = 1.0
+                if (
+                    period == "Y1"
+                    and product_id in rogue_budget
+                    and rogue_budget[product_id] > 0
+                ):
+                    rogue_mult = float(
+                        RNG.choice([RNG.uniform(0.20, 0.40), RNG.uniform(2.5, 5.0)])
+                    )
+                    rogue_budget[product_id] -= 1
+
                 price = (
                     base_price
                     * state_mult
@@ -278,6 +324,7 @@ def generate_transactions(
                     * leakage_mult
                     * dispersion_noise
                     * period_mult
+                    * rogue_mult
                 )
                 price = max(0.50, round(price, 2))
 
@@ -312,16 +359,22 @@ def main() -> None:
     products = build_products(subcats)
     reps = build_reps()
     customers = build_customers(reps)
-    anomalies = build_adhoc_anomalies(products)
+    anomalies_y0 = build_adhoc_anomalies(products, N_ADHOC_ANOMALIES_Y0)
+    anomalies_y1 = build_adhoc_anomalies(products, N_ADHOC_ANOMALIES_Y1)
+    y1_rogue_products = build_y1_rogue_products(products)
 
     print(f"  {len(products)} products across {len(subcats)} sub-categories")
     print(f"  {len(customers)} customers across {len(STATE_MULTIPLIERS)} states")
     print(f"  {len(reps)} reps")
-    print(f"  {len(anomalies)} ad-hoc product x state anomalies")
+    print(f"  {len(anomalies_y0)} ad-hoc product x state anomalies in Y0")
+    print(f"  {len(anomalies_y1)} ad-hoc product x state anomalies in Y1")
+    print(f"  {len(y1_rogue_products)} Y1 rogue products")
     print(f"  {N_LEAKAGE_CUSTOMERS} leakage customers")
 
     print("Generating transactions...")
-    transactions = generate_transactions(customers, products, anomalies)
+    transactions = generate_transactions(
+        customers, products, anomalies_y0, anomalies_y1, y1_rogue_products
+    )
     print(f"  {len(transactions):,} transaction rows generated")
 
     output_path = Path(__file__).resolve().parents[1] / "data" / "sales_synthetic.csv"
